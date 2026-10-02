@@ -1,0 +1,13 @@
+{
+  "name": "UNO Chess Online",
+  "short_name": "UNO Chess",
+  "description": "Gioca a UNO Chess online con un amico",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#101522",
+  "theme_color": "#101522",
+  "icons": [
+    { "src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

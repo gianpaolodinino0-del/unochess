@@ -5,6 +5,8 @@ import secrets
 import socket
 import string
 import threading
+import time
+from collections import deque
 import chess
 import chess.svg
 from flask import Flask, Response, jsonify, render_template, request, send_from_directory
@@ -14,8 +16,14 @@ from game.card_images import card_image_url
 from game.uno_game import UnoChessGame
 
 app = Flask(__name__, template_folder="web")
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 rooms: dict[str, dict] = {}
 rooms_lock = threading.RLock()
+recent_room_creates: deque[float] = deque()
+ROOM_TTL_SECONDS = 6 * 60 * 60
+MAX_ACTIVE_ROOMS = 100
+MAX_ROOM_CREATES_PER_MINUTE = 5
+ROOM_CODE_LENGTH = 8
 
 
 def error(message: str, status: int = 400):
@@ -42,6 +50,14 @@ def invite_base_url() -> str:
         return f"http://{address}:{request.environ.get('SERVER_PORT', '5000')}"
     scheme = request.headers.get("X-Forwarded-Proto", request.scheme).split(",", 1)[0]
     return f"{scheme}://{request.host}"
+
+
+def prune_rooms(now: float) -> None:
+    expired = [code for code, room in rooms.items() if now - room["last_activity"] > ROOM_TTL_SECONDS]
+    for code in expired:
+        del rooms[code]
+    while recent_room_creates and now - recent_room_creates[0] > 60:
+        recent_room_creates.popleft()
 
 
 def state_for(room: dict, token: str | None):
@@ -113,12 +129,19 @@ def card_asset(filename: str):
 @app.post("/api/rooms")
 def create_room():
     name = str((request.json or {}).get("name", "Giocatore 1")).strip()[:24] or "Giocatore 1"
-    code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(5))
+    code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(ROOM_CODE_LENGTH))
     token = secrets.token_urlsafe(24)
     with rooms_lock:
+        now = time.monotonic()
+        prune_rooms(now)
+        if len(recent_room_creates) >= MAX_ROOM_CREATES_PER_MINUTE:
+            return error("Troppe stanze create. Riprova tra un minuto.", 429)
+        if len(rooms) >= MAX_ACTIVE_ROOMS:
+            return error("Il server ha raggiunto il limite di stanze attive. Riprova più tardi.", 503)
         while code in rooms:
-            code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(5))
-        rooms[code] = {"code": code, "game": UnoChessGame(), "tokens": [token], "token_players": [0], "names": [name, None], "connected": [True, False]}
+            code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(ROOM_CODE_LENGTH))
+        recent_room_creates.append(now)
+        rooms[code] = {"code": code, "game": UnoChessGame(), "tokens": [token], "token_players": [0], "names": [name, None], "connected": [True, False], "last_activity": now}
     return jsonify(code=code, token=token, player=0, invite_base=invite_base_url())
 
 
@@ -135,6 +158,7 @@ def join_room(code: str):
         room["tokens"].append(token)
         room["names"][1] = name
         room["connected"][1] = True
+        room["last_activity"] = time.monotonic()
         room["token_players"] = [0, 1]
         secrets.SystemRandom().shuffle(room["token_players"])
         for seat, game_player in enumerate(room["token_players"]):
@@ -148,6 +172,8 @@ def join_room(code: str):
 def get_state(code: str):
     with rooms_lock:
         room, err = get_room(code)
+        if room is not None:
+            room["last_activity"] = time.monotonic()
         return err or jsonify(state_for(room, request.headers.get("X-Player-Token")))
 
 
@@ -157,6 +183,7 @@ def action(code: str):
         room, err = get_room(code)
         if err:
             return err
+        room["last_activity"] = time.monotonic()
         game: UnoChessGame = room["game"]
         seat = room["tokens"].index(request.headers.get("X-Player-Token"))
         player = room["token_players"][seat]
@@ -206,4 +233,4 @@ def action(code: str):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
